@@ -1,10 +1,11 @@
 #!/bin/bash
 
 # Minimal PostgreSQL startup script with full paths + repeatable migrations + seed
-DB_NAME="myapp"
-DB_USER="appuser"
-DB_PASSWORD="dbuser123"
-DB_PORT="5000"
+# Prefer env vars (set by platform) but keep defaults for local/dev use.
+DB_NAME="${POSTGRES_DB:-myapp}"
+DB_USER="${POSTGRES_USER:-appuser}"
+DB_PASSWORD="${POSTGRES_PASSWORD:-dbuser123}"
+DB_PORT="${POSTGRES_PORT:-5001}"
 
 echo "Starting PostgreSQL setup..."
 
