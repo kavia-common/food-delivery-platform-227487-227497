@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Minimal PostgreSQL startup script with full paths
+# Minimal PostgreSQL startup script with full paths + repeatable migrations + seed
 DB_NAME="myapp"
 DB_USER="appuser"
 DB_PASSWORD="dbuser123"
@@ -14,38 +14,46 @@ PG_BIN="/usr/lib/postgresql/${PG_VERSION}/bin"
 
 echo "Found PostgreSQL version: ${PG_VERSION}"
 
-# Check if PostgreSQL is already running on the specified port
-if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
-    echo "PostgreSQL is already running on port ${DB_PORT}!"
-    echo "Database: ${DB_NAME}"
-    echo "User: ${DB_USER}"
-    echo "Port: ${DB_PORT}"
-    echo ""
-    echo "To connect to the database, use:"
-    echo "psql -h localhost -U ${DB_USER} -d ${DB_NAME} -p ${DB_PORT}"
-    
-    # Check if connection info file exists
-    if [ -f "db_connection.txt" ]; then
-        echo "Or use: $(cat db_connection.txt)"
-    fi
-    
-    echo ""
-    echo "Script stopped - server already running."
-    exit 0
-fi
+MIGRATIONS_DIR="$(cd "$(dirname "$0")" && pwd)/migrations"
+MIGRATIONS_STATE_FILE="$(cd "$(dirname "$0")" && pwd)/.migrations_applied"
 
-# Also check if there's a PostgreSQL process running (in case pg_isready fails)
-if pgrep -f "postgres.*-p ${DB_PORT}" > /dev/null 2>&1; then
-    echo "Found existing PostgreSQL process on port ${DB_PORT}"
-    echo "Attempting to verify connection..."
-    
-    # Try to connect and verify the database exists
-    if sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -c '\q' 2>/dev/null; then
-        echo "Database ${DB_NAME} is accessible."
-        echo "Script stopped - server already running."
-        exit 0
+apply_sql_file() {
+    local file_path="$1"
+    echo "Applying: ${file_path}"
+    # Use ON_ERROR_STOP so failures halt startup early (important for CI + deterministic init).
+    PGPASSWORD="${DB_PASSWORD}" ${PG_BIN}/psql \
+        -h localhost -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" \
+        -v ON_ERROR_STOP=1 \
+        -f "${file_path}"
+}
+
+apply_migrations_if_needed() {
+    if [ ! -d "${MIGRATIONS_DIR}" ]; then
+        echo "No migrations directory found at ${MIGRATIONS_DIR}; skipping."
+        return 0
     fi
-fi
+
+    touch "${MIGRATIONS_STATE_FILE}"
+
+    # Apply in lexicographic order, once per file name.
+    # This provides a simple, repeatable init path that works with this container’s startup approach.
+    for f in "${MIGRATIONS_DIR}"/*.sql; do
+        if [ ! -f "$f" ]; then
+            continue
+        fi
+        local base
+        base="$(basename "$f")"
+        if grep -qx "${base}" "${MIGRATIONS_STATE_FILE}"; then
+            echo "Skipping already-applied migration: ${base}"
+            continue
+        fi
+
+        apply_sql_file "$f"
+        echo "${base}" >> "${MIGRATIONS_STATE_FILE}"
+    done
+
+    echo "Migrations complete."
+}
 
 # Initialize PostgreSQL data directory if it doesn't exist
 if [ ! -f "/var/lib/postgresql/data/PG_VERSION" ]; then
@@ -93,47 +101,30 @@ GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
 -- Connect to the specific database for schema-level permissions
 \c ${DB_NAME}
 
--- For PostgreSQL 15+, we need to handle public schema permissions differently
--- First, grant usage on public schema
+-- Ensure application user can work with objects in public schema
 GRANT USAGE ON SCHEMA public TO ${DB_USER};
-
--- Grant CREATE permission on public schema
 GRANT CREATE ON SCHEMA public TO ${DB_USER};
 
--- Make the user owner of all future objects they create in public schema
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TYPES TO ${DB_USER};
 
--- If you want the user to be able to create objects without restrictions,
--- you can make them the owner of the public schema (optional but effective)
--- ALTER SCHEMA public OWNER TO ${DB_USER};
-
--- Alternative: Grant all privileges on schema public to the user
 GRANT ALL ON SCHEMA public TO ${DB_USER};
-
--- Ensure the user can work with any existing objects
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${DB_USER};
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};
 GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${DB_USER};
 EOF
 
-# Additionally, connect to the specific database to ensure permissions
-sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} << EOF
--- Double-check permissions are set correctly in the target database
-GRANT ALL ON SCHEMA public TO ${DB_USER};
-GRANT CREATE ON SCHEMA public TO ${DB_USER};
-
--- Show current permissions for debugging
-\dn+ public
-EOF
+# Apply schema migrations + seed data (idempotent seeds recommended)
+echo "Applying migrations/seed..."
+apply_migrations_if_needed
 
 # Save connection command to a file
 echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@localhost:${DB_PORT}/${DB_NAME}" > db_connection.txt
 echo "Connection string saved to db_connection.txt"
 
-# Save environment variables to a file
+# Save environment variables to a file (used by db_visualizer)
 cat > db_visualizer/postgres.env << EOF
 export POSTGRES_URL="postgresql://localhost:${DB_PORT}/${DB_NAME}"
 export POSTGRES_USER="${DB_USER}"
